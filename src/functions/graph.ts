@@ -131,6 +131,7 @@ function parseGraphXml(
     const name = attrs["name"];
     if (!type || !name) return;
     const VALID_TYPES = new Set(["file", "function", "concept", "error", "decision", "pattern", "library", "person"]);
+    // Must match types listed in GRAPH_EXTRACTION_SYSTEM prompt — update both together
     if (!VALID_TYPES.has(type)) return; // skip corrupt/invalid types from LLM
     const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;

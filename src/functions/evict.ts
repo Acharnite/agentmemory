@@ -346,8 +346,11 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       // === Fix 1: Stale graph node/edge garbage collection ===
-      const staleNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => n.stale);
-      const staleEdges = (await kv.list<GraphEdge>(KV.graphEdges)).filter((e) => e.stale);
+      // Single KV scan — derive stale and all lists from the same result
+      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
+      const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
+      const staleNodes = allNodes.filter((n) => n.stale);
+      const staleEdges = allEdges.filter((e) => e.stale);
 
       for (const node of staleNodes) {
         if (dryRun) continue;
@@ -387,8 +390,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       // === Fix 3: Isolated node cleanup (0 edges, no observations, >7 days old) ===
-      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
-      const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
+      // Reuses allNodes/allEdges from Fix 1 above
       const nowTime = Date.now();
       const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 

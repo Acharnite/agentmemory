@@ -62,6 +62,9 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       }
     }
     if (isGraphExtractionEnabled()) {
+      // In-process dedup guard: prevents redundant graph-extract triggers
+      // for the same session. Single-process only — distributed deployments
+      // rely on graph-extract's own idempotency.
       const lockKey = `graph-extract-${data.sessionId}`;
       if (extractionLocks.has(lockKey)) {
         logger.info("Skipping duplicate graph-extract (lock held)", { sessionId: data.sessionId });
