@@ -5,6 +5,8 @@ import type {
   RawObservation,
   SessionSummary,
   Memory,
+  GraphNode,
+  GraphEdge,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -34,6 +36,9 @@ interface EvictionStats {
   capEvictions: number;
   expiredMemories: number;
   nonLatestMemories: number;
+  staleGraphNodes?: number;
+  staleGraphEdges?: number;
+  isolatedNodes?: number;
   dryRun: boolean;
 }
 
@@ -336,6 +341,85 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               });
               await deleteAccessLog(kv, mem.id);
             }
+          }
+        }
+      }
+
+      // === Fix 1: Stale graph node/edge garbage collection ===
+      const staleNodes = (await kv.list<GraphNode>(KV.graphNodes)).filter((n) => n.stale);
+      const staleEdges = (await kv.list<GraphEdge>(KV.graphEdges)).filter((e) => e.stale);
+
+      for (const node of staleNodes) {
+        if (dryRun) continue;
+        try {
+          await kv.delete(KV.graphNodes, node.id);
+          if (stats.staleGraphNodes === undefined) stats.staleGraphNodes = 0;
+          stats.staleGraphNodes++;
+          await recordAudit(kv, "delete", "mem::evict", [node.id], {
+            resource: "graph-node",
+            reason: "stale",
+            dryRun,
+          });
+        } catch (err) {
+          logger.warn("Eviction stale node delete failed", {
+            nodeId: node.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      for (const edge of staleEdges) {
+        if (dryRun) continue;
+        try {
+          await kv.delete(KV.graphEdges, edge.id);
+          if (stats.staleGraphEdges === undefined) stats.staleGraphEdges = 0;
+          stats.staleGraphEdges++;
+          await recordAudit(kv, "delete", "mem::evict", [edge.id], {
+            resource: "graph-edge",
+            reason: "stale",
+            dryRun,
+          });
+        } catch (err) {
+          logger.warn("Eviction stale edge delete failed", {
+            edgeId: edge.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      // === Fix 3: Isolated node cleanup (0 edges, no observations, >7 days old) ===
+      const allNodes = await kv.list<GraphNode>(KV.graphNodes);
+      const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
+      const nowTime = Date.now();
+      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+      for (const node of allNodes) {
+        if (node.stale) continue; // handled above
+        const hasEdges = allEdges.some(
+          (e) => e.sourceNodeId === node.id || e.targetNodeId === node.id,
+        );
+        if (hasEdges) continue;
+        const hasObs = (node.sourceObservationIds ?? []).length > 0;
+        if (hasObs) continue;
+        const age = nowTime - new Date(node.createdAt).getTime();
+        if (age < SEVEN_DAYS_MS) continue; // keep recent nodes
+        if (dryRun) {
+          if (stats.isolatedNodes === undefined) stats.isolatedNodes = 0;
+          stats.isolatedNodes++;
+        } else {
+          try {
+            await kv.delete(KV.graphNodes, node.id);
+            if (stats.isolatedNodes === undefined) stats.isolatedNodes = 0;
+            stats.isolatedNodes++;
+            await recordAudit(kv, "delete", "mem::evict", [node.id], {
+              resource: "graph-node",
+              reason: "isolated_no_edges_no_observations",
+              dryRun,
+            });
+          } catch (err) {
+            logger.warn("Eviction isolated node delete failed", {
+              nodeId: node.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       }

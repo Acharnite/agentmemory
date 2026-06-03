@@ -6,7 +6,7 @@ import type {
   CompressedObservation,
   MemoryProvider,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
   GRAPH_EXTRACTION_SYSTEM,
@@ -130,6 +130,8 @@ function parseGraphXml(
     const type = attrs["type"] as GraphNode["type"] | undefined;
     const name = attrs["name"];
     if (!type || !name) return;
+    const VALID_TYPES = new Set(["file", "function", "concept", "error", "decision", "pattern", "library", "person"]);
+    if (!VALID_TYPES.has(type)) return; // skip corrupt/invalid types from LLM
     const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;
     let propMatch;
@@ -215,8 +217,11 @@ export function registerGraphFunction(
         const existingEdges = await kv.list<GraphEdge>(KV.graphEdges);
 
         for (const node of nodes) {
-          const existing = existingNodes.find(
-            (n) => n.name === node.name && n.type === node.type,
+          const existing = existingNodes.find((n) => 
+            n.type === node.type && (
+              n.name === node.name || 
+              jaccardSimilarity(n.name.toLowerCase(), node.name.toLowerCase()) > 0.8
+            )
           );
           if (existing) {
             const merged = {
@@ -237,6 +242,16 @@ export function registerGraphFunction(
 
         for (const edge of edges) {
           const edgeKey = `${edge.sourceNodeId}|${edge.targetNodeId}|${edge.type}`;
+          // Skip redundant "related_to" when a more specific edge exists
+          if (edge.type === "related_to") {
+            const hasSpecificEdge = existingEdges.some(
+              (e) =>
+                e.type !== "related_to" &&
+                ((e.sourceNodeId === edge.sourceNodeId && e.targetNodeId === edge.targetNodeId) ||
+                 (e.sourceNodeId === edge.targetNodeId && e.targetNodeId === edge.sourceNodeId))
+            );
+            if (hasSpecificEdge) continue; // skip, redundant
+          }
           const existingEdge = existingEdges.find(
             (e) => `${e.sourceNodeId}|${e.targetNodeId}|${e.type}` === edgeKey,
           );

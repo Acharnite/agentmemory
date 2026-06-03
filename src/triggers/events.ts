@@ -7,6 +7,7 @@ import { isGraphExtractionEnabled } from "../config.js";
 import { logger } from "../logger.js";
 
 export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
+  const extractionLocks = new Set<string>();
   sdk.registerFunction(
     "event::session::started",
     async (data: { sessionId: string; project: string; cwd: string }) => {
@@ -61,23 +62,31 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       }
     }
     if (isGraphExtractionEnabled()) {
-      try {
-        const observations = await kv.list<CompressedObservation>(
-          KV.observations(data.sessionId),
-        );
-        const compressed = observations.filter((o) => o.title);
-        if (compressed.length > 0) {
-          sdk.trigger({
-            function_id: "mem::graph-extract",
-            payload: { observations: compressed },
-            action: TriggerAction.Void(),
+      const lockKey = `graph-extract-${data.sessionId}`;
+      if (extractionLocks.has(lockKey)) {
+        logger.info("Skipping duplicate graph-extract (lock held)", { sessionId: data.sessionId });
+      } else {
+        extractionLocks.add(lockKey);
+        try {
+          const observations = await kv.list<CompressedObservation>(
+            KV.observations(data.sessionId),
+          );
+          const compressed = observations.filter((o) => o.title);
+          if (compressed.length > 0) {
+            sdk.trigger({
+              function_id: "mem::graph-extract",
+              payload: { observations: compressed },
+              action: TriggerAction.Void(),
+            });
+          }
+        } catch (err) {
+          logger.warn("graph-extract trigger failed", {
+            sessionId: data.sessionId,
+            error: err instanceof Error ? err.message : String(err),
           });
+        } finally {
+          extractionLocks.delete(lockKey);
         }
-      } catch (err) {
-        logger.warn("graph-extract trigger failed", {
-          sessionId: data.sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
       }
     }
     return summary;
