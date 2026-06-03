@@ -218,12 +218,13 @@ export function registerGraphFunction(
         const existingEdges = await kv.list<GraphEdge>(KV.graphEdges);
 
         for (const node of nodes) {
-          const existing = existingNodes.find((n) => 
-            n.type === node.type && (
-              n.name === node.name || 
-              jaccardSimilarity(n.name.toLowerCase(), node.name.toLowerCase()) > 0.8
-            )
-          );
+          const existing = existingNodes.find((n) => {
+            if (n.type !== node.type) return false;
+            if (n.name === node.name) return true; // exact match
+            // Only apply Jaccard if both names have meaningful length
+            if (n.name.length < 3 || node.name.length < 3) return false;
+            return jaccardSimilarity(n.name.toLowerCase(), node.name.toLowerCase()) > 0.8;
+          });
           if (existing) {
             const merged = {
               ...existing,

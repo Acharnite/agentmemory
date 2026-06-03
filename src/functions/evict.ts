@@ -353,10 +353,13 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
       const staleEdges = allEdges.filter((e) => e.stale);
 
       for (const node of staleNodes) {
-        if (dryRun) continue;
+        if (stats.staleGraphNodes === undefined) stats.staleGraphNodes = 0;
+        if (dryRun) {
+          stats.staleGraphNodes++;
+          continue;
+        }
         try {
           await kv.delete(KV.graphNodes, node.id);
-          if (stats.staleGraphNodes === undefined) stats.staleGraphNodes = 0;
           stats.staleGraphNodes++;
           await recordAudit(kv, "delete", "mem::evict", [node.id], {
             resource: "graph-node",
@@ -371,10 +374,13 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         }
       }
       for (const edge of staleEdges) {
-        if (dryRun) continue;
+        if (stats.staleGraphEdges === undefined) stats.staleGraphEdges = 0;
+        if (dryRun) {
+          stats.staleGraphEdges++;
+          continue;
+        }
         try {
           await kv.delete(KV.graphEdges, edge.id);
-          if (stats.staleGraphEdges === undefined) stats.staleGraphEdges = 0;
           stats.staleGraphEdges++;
           await recordAudit(kv, "delete", "mem::evict", [edge.id], {
             resource: "graph-edge",
@@ -402,8 +408,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         if (hasEdges) continue;
         const hasObs = (node.sourceObservationIds ?? []).length > 0;
         if (hasObs) continue;
-        const age = nowTime - new Date(node.createdAt).getTime();
-        if (age < SEVEN_DAYS_MS) continue; // keep recent nodes
+        const createdAtMs = node.createdAt ? new Date(node.createdAt).getTime() : NaN;
+        if (!Number.isFinite(createdAtMs)) continue; // unknown age — preserve
+        if (nowTime - createdAtMs < SEVEN_DAYS_MS) continue; // keep recent nodes
         if (dryRun) {
           if (stats.isolatedNodes === undefined) stats.isolatedNodes = 0;
           stats.isolatedNodes++;
