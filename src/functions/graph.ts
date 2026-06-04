@@ -246,6 +246,7 @@ export function registerGraphFunction(
             ];
             await kv.set(KV.graphEdges, existingEdge.id, existingEdge);
           } else {
+            if (edge.type === "related_to" && existingEdges.some((e: any) => e.sourceNodeId === edge.sourceNodeId && e.targetNodeId === edge.targetNodeId && e.type !== "related_to")) continue;
             await kv.set(KV.graphEdges, edge.id, edge);
             existingEdges.push(edge);
           }
@@ -379,5 +380,102 @@ export function registerGraphFunction(
       nodesByType,
       edgesByType,
     };
+  });
+
+  sdk.registerFunction("mem::graph-gc", async () => {
+    const gcStats: Record<string, number> = { staleNodes: 0, staleEdges: 0, isolatedNodes: 0, redundantRelatedTo: 0 };
+    const allNodes = await kv.list(KV.graphNodes).catch(() => []);
+    const allEdges = await kv.list(KV.graphEdges).catch(() => []);
+
+    // Delete stale nodes
+    for (const node of allNodes) {
+      if (!node.stale) continue;
+      try {
+        await kv.delete(KV.graphNodes, node.id);
+        gcStats.staleNodes++;
+      } catch (err) {
+        logger.warn("Graph GC delete failed", {
+          resource: "graphNode",
+          id: node.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Delete stale edges
+    for (const edge of allEdges) {
+      if (!edge.stale) continue;
+      try {
+        await kv.delete(KV.graphEdges, edge.id);
+        gcStats.staleEdges++;
+      } catch (err) {
+        logger.warn("Graph GC delete failed", {
+          resource: "graphEdge",
+          id: edge.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Delete isolated nodes (no edges, no observations, older than 7 days)
+    const freshNodes = allNodes.filter((n: any) => !n.stale);
+    const freshEdges = allEdges.filter((e: any) => !e.stale);
+    const edgeNodeIds = new Set<string>();
+    for (const e of freshEdges) {
+      edgeNodeIds.add(e.sourceNodeId);
+      edgeNodeIds.add(e.targetNodeId);
+    }
+    const now = Date.now();
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    for (const node of freshNodes) {
+      const hasEdges = edgeNodeIds.has(node.id);
+      const hasObs = (node.sourceObservationIds ?? []).length > 0;
+      const isOld = node.createdAt ? now - new Date(node.createdAt).getTime() > sevenDaysMs : true;
+      if (!hasEdges && !hasObs && isOld) {
+        try {
+          await kv.delete(KV.graphNodes, node.id);
+          gcStats.isolatedNodes++;
+        } catch (err) {
+          logger.warn("Graph GC delete failed", {
+            resource: "graphNode",
+            id: node.id,
+            reason: "isolated_node",
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
+    // Dedup redundant related_to edges (where a stronger edge type exists between same nodes)
+    const edgePairMap: Record<string, any[]> = {};
+    for (const edge of freshEdges) {
+      const pairKey = `${edge.sourceNodeId}|${edge.targetNodeId}`;
+      if (!edgePairMap[pairKey]) edgePairMap[pairKey] = [];
+      edgePairMap[pairKey].push(edge);
+    }
+    for (const pairKey of Object.keys(edgePairMap)) {
+      const pairEdges = edgePairMap[pairKey];
+      if (pairEdges.some((e: any) => e.type !== "related_to")) {
+        for (const edge of pairEdges) {
+          if (edge.type === "related_to") {
+            try {
+              await kv.delete(KV.graphEdges, edge.id);
+              gcStats.redundantRelatedTo++;
+            } catch (err) {
+              logger.warn("Graph GC delete failed", {
+                resource: "graphEdge",
+                id: edge.id,
+                reason: "redundant_related_to",
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+        }
+      }
+    }
+
+    await recordAudit(kv, "delete", "mem::graph-gc", [], { stats: gcStats });
+    logger.info("Graph GC complete", { stats: gcStats });
+    return { success: true, stats: gcStats };
   });
 }

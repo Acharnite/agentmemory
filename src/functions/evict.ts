@@ -34,6 +34,8 @@ interface EvictionStats {
   capEvictions: number;
   expiredMemories: number;
   nonLatestMemories: number;
+  staleGraphNodes: number;
+  staleGraphEdges: number;
   dryRun: boolean;
 }
 
@@ -110,6 +112,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         capEvictions: 0,
         expiredMemories: 0,
         nonLatestMemories: 0,
+        staleGraphNodes: 0,
+        staleGraphEdges: 0,
         dryRun,
       };
 
@@ -337,6 +341,46 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               await deleteAccessLog(kv, mem.id);
             }
           }
+        }
+      }
+
+      // Stale graph node/edge GC
+      if (!dryRun) {
+        const staleNodes = (await kv.list(KV.graphNodes).catch(() => [])).filter((n: any) => n.stale);
+        for (const node of staleNodes) {
+          try {
+            await kv.delete(KV.graphNodes, node.id);
+            stats.staleGraphNodes = (stats.staleGraphNodes || 0) + 1;
+          } catch (err) {
+            logger.warn("Eviction delete failed", {
+              resource: "graphNode",
+              id: node.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            continue;
+          }
+          await recordAudit(kv, "delete", "mem::evict", [node.id], {
+            resource: "graphNode",
+            reason: "stale_graph_node",
+          });
+        }
+        const staleEdges = (await kv.list(KV.graphEdges).catch(() => [])).filter((e: any) => e.stale);
+        for (const edge of staleEdges) {
+          try {
+            await kv.delete(KV.graphEdges, edge.id);
+            stats.staleGraphEdges = (stats.staleGraphEdges || 0) + 1;
+          } catch (err) {
+            logger.warn("Eviction delete failed", {
+              resource: "graphEdge",
+              id: edge.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            continue;
+          }
+          await recordAudit(kv, "delete", "mem::evict", [edge.id], {
+            resource: "graphEdge",
+            reason: "stale_graph_edge",
+          });
         }
       }
 
