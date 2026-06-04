@@ -242,6 +242,27 @@ export function registerMcpEndpoints(
             };
           }
 
+          case "memory_procedural_list": {
+            const query = (args.query || "").toLowerCase();
+            const limit = typeof args.limit === "number" ? args.limit : 10;
+            const procedural = await kv.list<import("../types.js").ProceduralMemory>(KV.procedural);
+            const filtered = query
+              ? procedural.filter((p: any) =>
+                  p.name?.toLowerCase().includes(query) ||
+                  p.triggerCondition?.toLowerCase().includes(query)
+                )
+              : procedural;
+            const limited = filtered.slice(0, limit);
+            return {
+              status_code: 200,
+              body: {
+                content: [
+                  { type: "text", text: JSON.stringify({ procedural: limited, total: filtered.length }, null, 2) },
+                ],
+              },
+            };
+          }
+
           case "memory_sessions": {
             const sessions = await kv.list(KV.sessions);
             return {
