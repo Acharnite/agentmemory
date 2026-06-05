@@ -434,9 +434,6 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           }
         }
       }
-        }
-      }
-
       logger.info("Eviction complete", { stats });
       return stats;
     },
