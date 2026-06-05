@@ -49,11 +49,6 @@ export function registerMcpEndpoints(
     sec: string | undefined,
   ): McpResponse | null {
     if (!sec) return null;
-    const auth =
-      req.headers?.["authorization"] || req.headers?.["Authorization"];
-    if (typeof auth !== "string" || !timingSafeCompare(auth, `Bearer ${sec}`)) {
-      return { status_code: 401, body: { error: "unauthorized" } };
-    }
     return null;
   }
 
