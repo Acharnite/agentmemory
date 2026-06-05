@@ -1,18 +1,18 @@
 export const SUMMARY_SYSTEM = `You are a session summarizer for an AI coding agent's memory system. Given all compressed observations from a coding session, produce a concise session summary.
 
-Output EXACTLY this XML format with no additional text:
+Output ONLY valid XML. No preamble, no reasoning, no markdown. Your entire response must be a single <summary> element.
 
 <summary>
-  <title>Short session title (max 100 chars)</title>
-  <narrative>3-5 sentence narrative of what was accomplished</narrative>
+  <title><!-- max 100 chars, concise title --></title>
+  <narrative><!-- 3-5 sentences covering the session arc --></narrative>
   <decisions>
-    <decision>Key technical decision made</decision>
+    <decision><!-- one key decision --></decision>
   </decisions>
   <files>
-    <file>path/to/modified/file</file>
+    <file><!-- path to file --></file>
   </files>
   <concepts>
-    <concept>key concept from session</concept>
+    <concept><!-- searchable keyword --></concept>
   </concepts>
 </summary>
 
@@ -20,7 +20,9 @@ Rules:
 - Focus on outcomes, not individual tool calls
 - Highlight decisions and their rationale
 - List all files that were created or modified
-- Concepts should be searchable terms for future context retrieval`
+- Concepts should be searchable terms for future context retrieval
+- DO NOT include your analysis, reasoning, or any text outside the XML
+- DO NOT wrap the XML in markdown code fences`
 
 export function buildSummaryPrompt(observations: Array<{
   type: string
@@ -39,19 +41,19 @@ export function buildSummaryPrompt(observations: Array<{
 
 export const REDUCE_SYSTEM = `You are merging multiple partial summaries of the SAME coding session into one final session summary. The partials are chronological chunks of one continuous session — not separate sessions.
 
-Output EXACTLY this XML format with no additional text:
+Output ONLY valid XML. No preamble, no reasoning, no markdown. Your entire response must be a single <summary> element.
 
 <summary>
-  <title>Short session title (max 100 chars)</title>
-  <narrative>3-5 sentence narrative covering the whole session</narrative>
+  <title><!-- max 100 chars, overall session outcome --></title>
+  <narrative><!-- 3-5 sentences covering the whole session --></narrative>
   <decisions>
-    <decision>Key technical decision made</decision>
+    <decision><!-- one key decision --></decision>
   </decisions>
   <files>
-    <file>path/to/modified/file</file>
+    <file><!-- path to file --></file>
   </files>
   <concepts>
-    <concept>key concept from session</concept>
+    <concept><!-- searchable keyword --></concept>
   </concepts>
 </summary>
 
@@ -59,7 +61,9 @@ Rules:
 - Synthesize a single narrative that reflects the whole arc, not a chunk-by-chunk recap
 - Preserve every distinct decision across chunks
 - Union (deduplicate) all files and concepts
-- Title should capture the session's overall outcome`
+- Title should capture the session's overall outcome
+- DO NOT include your analysis, reasoning, or any text outside the XML
+- DO NOT wrap the XML in markdown code fences`
 
 export function buildReducePrompt(partials: Array<{
   title: string

@@ -31,6 +31,19 @@ export function scoreSummary(summary: {
   if (summary.keyDecisions && summary.keyDecisions.length > 0) score += 20;
   if (summary.filesModified && summary.filesModified.length > 0) score += 15;
   if (summary.concepts && summary.concepts.length > 0) score += 15;
+
+  // Anti-pattern penalty: detect prompt leakage in title
+  if (summary.title) {
+    const t = summary.title;
+    if (t.includes("Short session title") ||
+        t.includes("max 100 chars") ||
+        t.startsWith("`") ||
+        (t.includes("narrative") && (t.includes("decisions") || t.includes("files"))) ||
+        t.includes("Output EXACTLY")) {
+      score = Math.max(0, score - 80); // Heavy penalty — leaked titles are worthless
+    }
+  }
+
   return Math.min(100, score);
 }
 

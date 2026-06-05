@@ -203,6 +203,33 @@ function stripXmlWrappers(raw: string): string {
   return cleaned;
 }
 
+// Detects whether a parsed summary's title contains prompt-instruction
+// text leaked by the LLM instead of actual session content. Returns true
+// if any known leakage pattern matches — the caller should treat this as
+// a parse failure and retry.
+function isPromptLeakage(summary: SessionSummary): boolean {
+  const t = summary.title;
+
+  // Contains "Short session title" (case-insensitive)
+  if (/short session title/i.test(t)) return true;
+  // Contains "max 100 chars" (case-insensitive)
+  if (/max 100\s*chars/i.test(t)) return true;
+  // Starts with a backtick
+  if (t.startsWith("`")) return true;
+  // Contains "narrative" AND ("decisions" OR "files" OR "concepts")
+  if (/narrative/i.test(t) && (/decisions/i.test(t) || /files/i.test(t) || /concepts/i.test(t))) return true;
+  // Contains "Output EXACTLY" (case-insensitive)
+  if (/output\s+exactly/i.test(t)) return true;
+  // Length > 80 AND contains at least 2 structural keywords
+  if (t.length > 80) {
+    const keywords = ["title", "narrative", "decision", "file", "concept", "rules:", "task:"];
+    const matchCount = keywords.filter((kw) => t.toLowerCase().includes(kw)).length;
+    if (matchCount >= 2) return true;
+  }
+
+  return false;
+}
+
 function parseSummaryXml(
   xml: string,
   sessionId: string,
@@ -213,7 +240,7 @@ function parseSummaryXml(
   const title = getXmlTag(cleaned, "title");
   if (!title) return null;
 
-  return {
+  const summary: SessionSummary = {
     sessionId,
     project,
     createdAt: new Date().toISOString(),
@@ -224,6 +251,18 @@ function parseSummaryXml(
     concepts: getXmlChildren(cleaned, "concepts", "concept"),
     observationCount: obsCount,
   };
+
+  // Anti-pattern detection: if the title looks like leaked prompt text,
+  // treat this as a parse failure so the retry loop can re-roll.
+  if (isPromptLeakage(summary)) {
+    logger.warn("Prompt leakage detected in summary", {
+      sessionId,
+      title: summary.title,
+    });
+    return null;
+  }
+
+  return summary;
 }
 
 export function registerSummarizeFunction(
@@ -248,10 +287,25 @@ export function registerSummarizeFunction(
         return { success: false, error: "session_not_found" };
       }
 
+      // Load observations first so we can check whether new observations
+      // have been added since the last summary was created.
       const observations = await kv.list<CompressedObservation>(
         KV.observations(sessionId),
       );
       const compressed = observations.filter((o) => o.title);
+
+      // Dedup: skip summarization only if a summary exists AND no new
+      // observations have been added since it was created.
+      const existingSummary = await kv.get<SessionSummary>(KV.summaries, sessionId);
+      if (existingSummary && existingSummary.observationCount >= compressed.length) {
+        const qualityScore = scoreSummary(existingSummary);
+        logger.info("Session already summarized — no new observations, skipping", {
+          sessionId,
+          summaryTitle: existingSummary.title,
+          observationCount: existingSummary.observationCount,
+        });
+        return { success: true, summary: existingSummary, qualityScore };
+      }
 
       if (compressed.length === 0) {
         logger.info("No observations to summarize", {

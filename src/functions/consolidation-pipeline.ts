@@ -3,7 +3,6 @@ import type {
   SemanticMemory,
   ProceduralMemory,
   SessionSummary,
-  Memory,
   MemoryProvider,
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
@@ -148,14 +147,20 @@ export function registerConsolidationPipelineFunction(
       }
 
       if (tier === "all" || tier === "procedural") {
-        const memories = await kv.list<Memory>(KV.memories);
-        const patterns = memories
-          .filter((m) => m.isLatest && m.type === "pattern")
-          .map((m) => ({
-            content: m.content,
-            frequency: m.sessionIds.length || 1,
-          }))
-          .filter((p) => p.frequency >= 2);
+        let patterns: Array<{ content: string; frequency: number }> = [];
+        try {
+          const patternsResult = await sdk.trigger({
+            function_id: "mem::patterns",
+            payload: { project: data?.project },
+          });
+          const result = patternsResult as { patterns?: Array<{ description: string; frequency: number }> };
+          patterns = (result?.patterns || [])
+            .filter((p: any) => p.frequency >= 2)
+            .map((p: any) => ({ content: p.description, frequency: p.frequency }));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn("Procedural patterns fetch failed", { error: msg });
+        }
 
         if (patterns.length >= 2) {
           const prompt = buildProceduralExtractionPrompt(patterns);

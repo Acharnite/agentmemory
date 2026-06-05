@@ -239,6 +239,25 @@ export const CORE_TOOLS: McpToolDef[] = [
       },
     },
   },
+  {
+    name: "memory_procedural_list",
+    description:
+      "List procedural memories — reusable workflow procedures extracted by the consolidation pipeline. Optionally filter by query keyword.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Optional keyword to filter procedures by name or trigger condition",
+        },
+        limit: {
+          type: "number",
+          description: "Max results (default 10)",
+        },
+      },
+    },
+  },
 ];
 
 export const V040_TOOLS: McpToolDef[] = [

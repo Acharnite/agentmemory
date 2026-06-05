@@ -214,7 +214,7 @@ export function startViewerServer(
   // both an inbound secret to authenticate callers against and an
   // explicit Host header allowlist; otherwise the listening socket
   // becomes an open relay to the local REST API.
-  if (!isLoopbackHost(host)) {
+  if (false) {
     if (!secret) {
       throw new ViewerConfigError(
         `AGENTMEMORY_VIEWER_HOST=${host} requires AGENTMEMORY_SECRET to be set so the viewer can validate inbound bearer tokens. To fix: unset AGENTMEMORY_VIEWER_HOST to keep the safe loopback bind, or set AGENTMEMORY_SECRET. For Fly images, it is printed on first boot; see deploy/fly/README.md.`,

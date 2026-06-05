@@ -45,6 +45,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     config: { topic: "agentmemory.observation" },
   });
 
+  const extractionLocks = new Set<string>();
+
   sdk.registerFunction("event::session::stopped", async (data: { sessionId: string }) => {
     const summary = await sdk.trigger({ function_id: "mem::summarize", payload: data });
     if (isReflectEnabled()) {
@@ -76,7 +78,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
           );
           const compressed = observations.filter((o) => o.title);
           if (compressed.length > 0) {
-            await sdk.trigger({
+            void sdk.trigger({
               function_id: "mem::graph-extract",
               payload: { observations: compressed },
               action: TriggerAction.Void(),

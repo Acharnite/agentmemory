@@ -115,6 +115,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         capEvictions: 0,
         expiredMemories: 0,
         nonLatestMemories: 0,
+        staleGraphNodes: 0,
+        staleGraphEdges: 0,
         dryRun,
       };
 
@@ -345,7 +347,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         }
       }
 
-      // === Fix 1: Stale graph node/edge garbage collection ===
+      // Stale graph node/edge garbage collection
       // Single KV scan — derive stale and all lists from the same result
       const allNodes = await kv.list<GraphNode>(KV.graphNodes);
       const allEdges = await kv.list<GraphEdge>(KV.graphEdges);
@@ -395,8 +397,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         }
       }
 
-      // === Fix 3: Isolated node cleanup (0 edges, no observations, >7 days old) ===
-      // Reuses allNodes/allEdges from Fix 1 above
+      // Isolated node cleanup (0 edges, no observations, >7 days old)
+      // Reuses allNodes/allEdges from the scan above
       const nowTime = Date.now();
       const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -430,6 +432,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               error: err instanceof Error ? err.message : String(err),
             });
           }
+        }
+      }
         }
       }
 
