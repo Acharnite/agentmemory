@@ -493,6 +493,9 @@ export function registerGraphFunction(
         let newNodeCount = 0;
         let newEdgeCount = 0;
         const newEdgesForTopCheck: GraphEdge[] = [];
+        // #813: cache all nodes once for fuzzy dedup, avoiding per-node kv.list calls
+        const allNodes = await kv.list<GraphNode>(KV.graphNodes);
+        const nodeIdMap = new Map<string, string>();
 
         for (const node of nodes) {
           const indexKey = nameIndexKey(node.type, node.name);
@@ -504,13 +507,15 @@ export function registerGraphFunction(
           let existing: GraphNode | null = null;
           if (existingId) {
             existing = await kv.get<GraphNode>(KV.graphNodes, existingId);
+            // #813: skip stale nodes — they shouldn't merge
+            if (existing?.stale) existing = null;
           }
 
-          // Fix 2: Fuzzy dedup via Jaccard similarity (if exact match failed)
+          // #813: Fuzzy dedup via Jaccard similarity (if exact match failed)
           if (!existing && node.name.length >= 3) {
-            const allNodes = await kv.list<GraphNode>(KV.graphNodes);
             existing = allNodes.find(
               (n) =>
+                !n.stale &&
                 n.type === node.type &&
                 n.name.length >= 3 &&
                 jaccardSimilarity(n.name.toLowerCase(), node.name.toLowerCase()) > 0.8,
@@ -525,14 +530,19 @@ export function registerGraphFunction(
               (n) => n.id === existing!.id,
             );
             if (topIdx !== -1) snap.topNodes[topIdx] = merged;
+            // #813: track mapping from parsed ID -> persisted ID
+            nodeIdMap.set(node.id, existing.id);
           } else {
-            await kv.set(KV.graphNodes, node.id, node);
-            await kv.set(KV.graphNameIndex, indexKey, node.id);
-            await kv.set(KV.graphNodeDegree, node.id, 0);
+            await Promise.all([
+              kv.set(KV.graphNodes, node.id, node),
+              kv.set(KV.graphNameIndex, indexKey, node.id),
+              kv.set(KV.graphNodeDegree, node.id, 0),
+            ]);
             snap.stats.totalNodes += 1;
             snap.stats.nodesByType[node.type] =
               (snap.stats.nodesByType[node.type] ?? 0) + 1;
             newNodeCount += 1;
+            nodeIdMap.set(node.id, node.id);
             if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
               // Degree 0 still beats an empty slot — sit at the tail
               // until edges arrive and promote.
@@ -543,6 +553,20 @@ export function registerGraphFunction(
         }
 
         for (const edge of edges) {
+          // #813: remap transient parsed node IDs to persisted node IDs
+          const srcId = nodeIdMap.get(edge.sourceNodeId);
+          const tgtId = nodeIdMap.get(edge.targetNodeId);
+          if (!srcId || !tgtId) {
+            logger.warn("Edge references unknown node, skipping", {
+              edgeId: edge.id,
+              sourceNodeId: edge.sourceNodeId,
+              targetNodeId: edge.targetNodeId,
+            });
+            continue;
+          }
+          edge.sourceNodeId = srcId;
+          edge.targetNodeId = tgtId;
+
           const eKey = edgeIndexKey(
             edge.sourceNodeId,
             edge.targetNodeId,
@@ -564,8 +588,10 @@ export function registerGraphFunction(
             );
             if (topIdx !== -1) snap.topEdges[topIdx] = merged;
           } else {
-            await kv.set(KV.graphEdges, edge.id, edge);
-            await kv.set(KV.graphEdgeKey, eKey, edge.id);
+            await Promise.all([
+              kv.set(KV.graphEdges, edge.id, edge),
+              kv.set(KV.graphEdgeKey, eKey, edge.id),
+            ]);
             snap.stats.totalEdges += 1;
             snap.stats.edgesByType[edge.type] =
               (snap.stats.edgesByType[edge.type] ?? 0) + 1;
