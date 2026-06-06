@@ -124,6 +124,14 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         if (supersededMemory) {
           supersededMemory.isLatest = false;
           await kv.set(KV.memories, supersededMemory.id, supersededMemory);
+          const relation = {
+            type: "supersedes",
+            sourceId: memory.id,
+            targetId: supersededMemory.id,
+            createdAt: now,
+            confidence: 1,
+          };
+          await kv.set(KV.relations, generateId("rel"), relation);
         }
         await kv.set(KV.memories, memory.id, memory);
 
