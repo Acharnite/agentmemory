@@ -12,7 +12,7 @@ sudo cp dist/index.mjs /usr/local/lib/node_modules/@agentmemory/agentmemory/dist
 
 echo ""
 echo "==> Verifying patch..."
-if grep -q "supersedes.*sourceId.*memory" /usr/local/lib/node_modules/@agentmemory/agentmemory/dist/index.mjs; then
+if grep -q 'type: "supersedes"' /usr/local/lib/node_modules/@agentmemory/agentmemory/dist/index.mjs; then
     echo "✅ Patch confirmed in deployed file"
 else
     echo "❌ Patch NOT found — something went wrong!"
