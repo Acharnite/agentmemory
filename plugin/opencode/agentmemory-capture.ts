@@ -71,6 +71,44 @@ const contextInjectedSessions = new Set<string>();
 // don't implement experimental.chat.system.transform).
 const startContextCache = new Map<string, string>();
 
+// ── Session lifecycle management ──
+const IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+function resetIdleTimer(): void {
+  if (idleTimer !== null) clearTimeout(idleTimer);
+  idleTimer = setTimeout(async () => {
+    if (activeSessionId) {
+      if (DEBUG) console.log(`[agentmemory] Idle timeout reached for session ${activeSessionId}`);
+      await post("/session/end", { sessionId: activeSessionId });
+      const sid = activeSessionId;
+      activeSessionId = null;
+      pruneSessionMaps(sid);
+      startContextCache.delete(sid);
+      contextInjectedSessions.delete(sid);
+    }
+    idleTimer = null;
+  }, IDLE_TIMEOUT_MS);
+}
+
+function clearIdleTimer(): void {
+  if (idleTimer !== null) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function registerExitHandlers(): void {
+  const handleExit = async () => {
+    if (activeSessionId) {
+      if (DEBUG) console.log(`[agentmemory] Process exiting, ending session ${activeSessionId}`);
+      await post("/session/end", { sessionId: activeSessionId });
+    }
+  };
+  process.on("SIGTERM", handleExit);
+  process.on("SIGINT", handleExit);
+}
+
 function stashFor(sid: string): Set<string> {
   let s = stashedFiles.get(sid);
   if (!s) { s = new Set<string>(); stashedFiles.set(sid, s); }
@@ -169,6 +207,7 @@ function extractErrorMessage(err: unknown): string {
 
 export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
   projectPath = ctx.worktree || ctx.project?.id || process.cwd();
+  registerExitHandlers();
 
   return {
     event: async ({ event }) => {
@@ -206,6 +245,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           await observe(sessionId, "config_loaded", pendingConfig);
           pendingConfig = null;
         }
+        resetIdleTimer();
       }
 
       // ── session.idle ── (summarize handled in session.status idle branch)
@@ -239,6 +279,22 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         const info = props.info as Record<string, unknown> | undefined;
         const sid = (info?.id as string) || props.sessionID || activeSessionId;
         if (!sid) return;
+
+        // Detect archive — OpenCode sets time.archived when user archives a session
+        const time = info?.time as Record<string, unknown> | undefined;
+        if (time && typeof time.archived === "number") {
+          if (DEBUG) console.log(`[agentmemory] Session ${sid} archived, ending`);
+          await post("/session/end", { sessionId: sid });
+          post("/crystals/auto", { olderThanDays: 7 }, 30000);
+          post("/consolidate-pipeline", { tier: "all", force: true }, 30000);
+          if (sid === activeSessionId) activeSessionId = null;
+          pruneSessionMaps(sid);
+          startContextCache.delete(sid);
+          contextInjectedSessions.delete(sid);
+          clearIdleTimer();
+          return;
+        }
+
         await observe(sid, "session_updated", {
           title: info?.title ?? null,
           parentID: info?.parentID ?? null,
@@ -277,6 +333,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         seenSubtaskIds.delete(sid);
         seenToolCallIds.delete(sid);
         contextInjectedSessions.delete(sid);
+        clearIdleTimer();
       }
 
       // ── session.error ──
@@ -525,6 +582,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
             name: props.name,
             arguments: props.arguments || "",
           });
+          resetIdleTimer();
         }
       }
     },
@@ -559,6 +617,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         files: files.slice(0, 20),
         parts_summary: parts.map((p: any) => p.type).filter(Boolean),
       });
+      resetIdleTimer();
     },
 
     // ── chat.params ──
@@ -595,6 +654,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         stash.clear();
         for (const f of keep) stash.add(f);
       }
+      resetIdleTimer();
     },
 
     // ── experimental.chat.system.transform ──
