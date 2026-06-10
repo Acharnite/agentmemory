@@ -254,7 +254,7 @@ describe("Graph Functions", () => {
 
     // Post-#814 the empty-body path reads the snapshot exclusively.
     // Backfill the snapshot from the seeded data first.
-    await sdk.trigger("mem::graph-snapshot-rebuild", {});
+    await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
 
     const unbounded = (await sdk.trigger(
       "mem::graph-query",
@@ -286,7 +286,7 @@ describe("Graph Functions", () => {
       await kv.set("mem:graph:nodes", node.id, node);
     }
 
-    await sdk.trigger("mem::graph-snapshot-rebuild", {});
+    await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
 
     const page1 = (await sdk.trigger("mem::graph-query", {
       limit: 10,
@@ -322,7 +322,7 @@ describe("Graph Functions", () => {
       });
     }
 
-    await sdk.trigger("mem::graph-snapshot-rebuild", {});
+    await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
 
     const huge = (await sdk.trigger("mem::graph-query", {
       limit: 999999,
@@ -373,7 +373,7 @@ describe("Graph Functions", () => {
       lastSeen: "2026-01-01T00:00:00Z",
     });
 
-    await sdk.trigger("mem::graph-snapshot-rebuild", {});
+    await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
 
     const page = (await sdk.trigger("mem::graph-query", {
       limit: 10,
@@ -427,7 +427,7 @@ describe("Graph Functions", () => {
 
     it("snapshot-rebuild persists top-degree subgraph + aggregate stats", async () => {
       await seed(50, 100);
-      const result = (await sdk.trigger("mem::graph-snapshot-rebuild", {})) as {
+      const result = (await sdk.trigger("mem::graph-snapshot-rebuild", { force: true })) as {
         success: boolean;
         totalNodes: number;
         totalEdges: number;
@@ -456,7 +456,7 @@ describe("Graph Functions", () => {
 
     it("graph-query empty-body branch serves from snapshot once it exists", async () => {
       await seed(20, 30);
-      await sdk.trigger("mem::graph-snapshot-rebuild", {});
+      await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
 
       const result = (await sdk.trigger("mem::graph-query", {})) as GraphQueryResult;
       expect(result.fromSnapshot).toBe(true);
@@ -466,7 +466,7 @@ describe("Graph Functions", () => {
 
     it("graph-query nodeType filter respects snapshot type counts", async () => {
       await seed(30, 0);
-      await sdk.trigger("mem::graph-snapshot-rebuild", {});
+      await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
 
       const fileQuery = (await sdk.trigger("mem::graph-query", {
         nodeType: "file",
@@ -481,7 +481,7 @@ describe("Graph Functions", () => {
 
     it("graph-stats returns from snapshot when not dirty", async () => {
       await seed(15, 25);
-      await sdk.trigger("mem::graph-snapshot-rebuild", {});
+      await sdk.trigger("mem::graph-snapshot-rebuild", { force: true });
 
       const stats = (await sdk.trigger("mem::graph-stats", {})) as {
         totalNodes: number;
@@ -559,31 +559,27 @@ describe("Graph Functions", () => {
       expect(snap?.stats.totalNodes).toBe(0);
     });
 
-    it("graph-reset also wipes composite-key index scopes", async () => {
+    it("graph-reset writes empty snapshot; legacy rows stay as orphans (#825)", async () => {
       await sdk.trigger("mem::graph-extract", { observations: [testObs] });
-      // Index entries exist after the extract — name-index keyed by
-      // type|name; degree keyed by nodeId; edge-key by composite
-      // src|tgt|type.
+      // Index entries exist after the extract.
       const nameBefore = await kv.get(
         "mem:graph:name-index",
         "file|src/index.ts",
       );
       expect(nameBefore).not.toBeNull();
-      const edgeKeyBefore = await kv.list("mem:graph:edge-key");
-      expect(edgeKeyBefore.length).toBeGreaterThan(0);
 
       await sdk.trigger("mem::graph-reset", {});
 
-      const nameAfter = await kv.get(
-        "mem:graph:name-index",
-        "file|src/index.ts",
-      );
-      expect(nameAfter).toBeNull();
-      const edgeKeyAfter = await kv.list("mem:graph:edge-key");
-      expect(edgeKeyAfter.length).toBe(0);
-      // Same for the per-node degree counter.
-      const degree = await kv.list("mem:graph:node-degree");
-      expect(degree.length).toBe(0);
+      // Post-#825: reset is enumeration-free. It writes an empty
+      // snapshot; the legacy index rows remain on disk as orphans
+      // but are never read by any post-#816 code path (hot path
+      // reads only the snapshot, which is now empty). Asserting the
+      // visible behavior: snapshot empty, hot path returns empty.
+      const snap = await kv.get<{
+        stats: { totalNodes: number; totalEdges: number };
+      }>("mem:graph:snapshot", "current");
+      expect(snap?.stats.totalNodes).toBe(0);
+      expect(snap?.stats.totalEdges).toBe(0);
     });
   });
 
@@ -679,11 +675,58 @@ describe("Graph Functions", () => {
 
       const result = (await localSdk.trigger(
         "mem::graph-snapshot-rebuild",
-        {},
+        { force: true },
       )) as { success: boolean; tooLarge?: boolean; totalNodes?: number };
       expect(result.success).toBe(false);
       expect(result.tooLarge).toBe(true);
       expect(result.totalNodes).toBeGreaterThanOrEqual(25001);
+    });
+
+    // #825: new pre-flight refusal when no snapshot exists (signals
+    // legacy corpus that would crash on kv.list). force=true bypasses.
+    it("graph-snapshot-rebuild refuses on legacy corpus (no snapshot) without force", async () => {
+      const localKv = mockKV();
+      // Seed nodes but never persist a snapshot → simulates a corpus
+      // built on a pre-#814 agentmemory.
+      await localKv.set("mem:graph:nodes", "legacy_n", {
+        id: "legacy_n",
+        type: "concept",
+        name: "legacy",
+        properties: {},
+        sourceObservationIds: [],
+        createdAt: "2026-01-01T00:00:00Z",
+        stale: false,
+      });
+      const localSdk = mockSdk();
+      registerGraphFunction(localSdk as never, localKv as never, mockProvider as never);
+
+      const result = (await localSdk.trigger(
+        "mem::graph-snapshot-rebuild",
+        {},
+      )) as { success: boolean; legacyCorpus?: boolean; error?: string };
+      expect(result.success).toBe(false);
+      expect(result.legacyCorpus).toBe(true);
+      expect(result.error).toMatch(/graph\/reset|force/);
+    });
+
+    it("graph-reset is enumeration-free (does not call kv.list)", async () => {
+      // Wrap the mock kv.list with a counter; assert it stays at 0
+      // across a full reset cycle.
+      const localKv = mockKV();
+      let listCalls = 0;
+      const baseList = localKv.list;
+      localKv.list = async <T,>(scope: string): Promise<T[]> => {
+        listCalls += 1;
+        return baseList.call(localKv, scope) as Promise<T[]>;
+      };
+      const localSdk = mockSdk();
+      registerGraphFunction(localSdk as never, localKv as never, mockProvider as never);
+
+      const result = (await localSdk.trigger("mem::graph-reset", {})) as {
+        success: boolean;
+      };
+      expect(result.success).toBe(true);
+      expect(listCalls).toBe(0);
     });
   });
 });

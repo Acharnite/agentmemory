@@ -1,5 +1,5 @@
 import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
-import type { Session, CompressedObservation, HookPayload, CommitLink } from "../types.js";
+import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -361,7 +361,7 @@ export function registerApiTriggers(
     },
   });
 
-  sdk.registerFunction("api::search", 
+  sdk.registerFunction("api::search",
     async (
       req: ApiRequest<{
         query: string;
@@ -370,9 +370,16 @@ export function registerApiTriggers(
         cwd?: string;
         format?: string;
         token_budget?: number;
+        agentId?: string;
       }>,
     ): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;
+      const queryAgentId =
+        typeof (req as { query_params?: Record<string, string> })
+          .query_params?.["agentId"] === "string"
+          ? (req as { query_params: Record<string, string> })
+              .query_params["agentId"]
+          : undefined;
       if (typeof body.query !== "string" || !body.query.trim()) {
         return { status_code: 400, body: { error: "query is required and must be a non-empty string" } };
       }
@@ -407,6 +414,14 @@ export function registerApiTriggers(
           body: { error: "token_budget must be a positive integer" },
         };
       }
+      // #817: propagate agentId so the upstream isolation filter
+      // applies. Honors body.agentId (POST body), ?agentId=... query
+      // param, or implicit fallback to the worker's AGENT_ID when
+      // AGENTMEMORY_AGENT_SCOPE=isolated.
+      const bodyAgentId =
+        typeof body.agentId === "string" && body.agentId.trim().length > 0
+          ? (body.agentId as string).trim()
+          : undefined;
       const payload = {
         query: body.query.trim(),
         limit: body.limit as number | undefined,
@@ -417,6 +432,7 @@ export function registerApiTriggers(
             ? body.format.trim().toLowerCase()
             : undefined,
         token_budget: body.token_budget as number | undefined,
+        agentId: bodyAgentId ?? queryAgentId,
       };
       const result = await sdk.trigger({ function_id: "mem::search", payload: payload });
       return { status_code: 200, body: result };
@@ -807,7 +823,15 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
-      return { status_code: 200, body: { sessions: filtered } };
+      const summaries = await Promise.all(
+        filtered.map((s) =>
+          kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
+        ),
+      );
+      const withSummary = filtered.map((s, i) =>
+        summaries[i] ? { ...s, summary: summaries[i] } : s,
+      );
+      return { status_code: 200, body: { sessions: withSummary } };
     },
   );
   sdk.registerTrigger({

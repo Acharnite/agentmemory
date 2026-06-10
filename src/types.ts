@@ -483,6 +483,12 @@ export interface GraphSnapshot {
   };
   updatedAt: string;
   dirty: boolean;
+  // #825 follow-up: ISO timestamp set by mem::graph-reset. After
+  // reset, mem::graph-extract treats any pre-resetAt node as an
+  // orphan (skip merge, write fresh) so future extracts don't
+  // silently reconnect to legacy rows via stale name-index entries.
+  // Absent / 1970 epoch = no reset has run.
+  resetAt?: string;
 }
 
 export type ConsolidationTier =

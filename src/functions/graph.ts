@@ -507,6 +507,19 @@ export function registerGraphFunction(
           let existing: GraphNode | null = null;
           if (existingId) {
             existing = await kv.get<GraphNode>(KV.graphNodes, existingId);
+            // #825 follow-up: name-index lookups can resolve into
+            // pre-reset rows. Drop them so extract writes a fresh
+            // node + index entry instead of silently reconnecting
+            // to a legacy orphan (which would keep the snapshot at
+            // 0 forever after a reset).
+            if (
+              existing &&
+              snap.resetAt &&
+              typeof existing.createdAt === "string" &&
+              existing.createdAt < snap.resetAt
+            ) {
+              existing = null;
+            }
             // #813: skip stale nodes — they shouldn't merge
             if (existing?.stale) existing = null;
           }
@@ -577,6 +590,15 @@ export function registerGraphFunction(
           let existing: GraphEdge | null = null;
           if (existingId) {
             existing = await kv.get<GraphEdge>(KV.graphEdges, existingId);
+            // Same #825 orphan check as the node path above.
+            if (
+              existing &&
+              snap.resetAt &&
+              typeof existing.createdAt === "string" &&
+              existing.createdAt < snap.resetAt
+            ) {
+              existing = null;
+            }
           }
 
           if (existing) {
@@ -837,17 +859,60 @@ export function registerGraphFunction(
   // run on corpora large enough that the response payload would
   // block the worker heartbeat. Above the ceiling the only safe path
   // is mem::graph-reset followed by incremental re-extraction.
-  sdk.registerFunction("mem::graph-snapshot-rebuild", async () => {
-    const started = Date.now();
-    try {
-      const [nodes, edges] = await withTimeout(
-        Promise.all([
-          kv.list<GraphNode>(KV.graphNodes),
-          kv.list<GraphEdge>(KV.graphEdges),
-        ]),
-        LIVE_ENUMERATION_BUDGET_MS,
-        "graph-snapshot-rebuild enumeration",
-      );
+  sdk.registerFunction(
+    "mem::graph-snapshot-rebuild",
+    async (data?: { force?: boolean }) => {
+      const started = Date.now();
+      // #825: pre-flight refusal for legacy corpora. The old guard
+      // checked node count AFTER kv.list, but the heartbeat dies at
+      // ~0.35s on a 75K-node response — long before the wall-clock
+      // budget can fire. We can't safely enumerate to discover size.
+      //
+      // Heuristic: if no snapshot exists, the corpus is either empty
+      // or legacy. The empty case has nothing to rebuild; the legacy
+      // case will crash. Refuse both unless `force: true` is passed
+      // (operator opt-in to attempt rebuild on a corpus they know is
+      // small enough — typically under 10K nodes on the default iii
+      // state adapter).
+      // Strict boolean check on force — accept only literal `true`,
+      // never truthy strings/numbers, so a hand-crafted JSON payload
+      // can't accidentally bypass the legacy-corpus safeguard.
+      const forceRebuild = data?.force === true;
+      try {
+        const existing = await readSnapshot(kv);
+        if (!existing && !forceRebuild) {
+          logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
+            hint: "legacy corpus or empty store",
+          });
+          return {
+            success: false,
+            legacyCorpus: true,
+            error:
+              "No prior snapshot found. Rebuild would call kv.list on " +
+              "KV.graphNodes/Edges, which heartbeat-crashes the worker " +
+              "on corpora past the iii state response budget (~25K nodes). " +
+              "Either (a) call POST /agentmemory/graph/reset to drop into " +
+              "incremental-only mode and rebuild from new extracts, or " +
+              "(b) re-send with `force: true` if you're certain the " +
+              "corpus is small.",
+          };
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn("Graph snapshot pre-flight read failed", { error: msg });
+        // Fall through; the user passed force=true or the snapshot
+        // read itself failed (separate problem).
+      }
+
+      try {
+        const [nodes, edges] = await withTimeout(
+          Promise.all([
+            kv.list<GraphNode>(KV.graphNodes),
+            kv.list<GraphEdge>(KV.graphEdges),
+          ]),
+          LIVE_ENUMERATION_BUDGET_MS,
+          "graph-snapshot-rebuild enumeration",
+        );
 
       if (nodes.length > REBUILD_SAFE_NODE_CEILING) {
         logger.warn("Graph snapshot rebuild aborted: corpus too large", {
@@ -927,104 +992,43 @@ export function registerGraphFunction(
     }
   });
 
-  // #814 v2: clean-restart escape hatch for legacy corpora too large
-  // for safe rebuild. Wipes every graph KV scope and writes an empty
-  // snapshot. Observations are NOT touched, so recall + history stay
-  // intact; the graph rebuilds incrementally from future
-  // mem::graph-extract calls (or a one-shot api::graph-build replay
-  // from existing observations).
+  // #814 v2 + #825: clean-restart escape hatch for corpora of any
+  // size, including the legacy 75K+ case that crashes kv.list.
+  //
+  // Previous reset walked kv.list<GraphNode/Edge>(...) which is the
+  // exact primitive that heartbeat-crashes the worker on the corpus
+  // this reset was meant to recover (Allan's repro, 0.35s death).
+  //
+  // The new design is enumeration-free: write an empty snapshot and
+  // return. The hot path (mem::graph-query empty-body, mem::graph-stats)
+  // reads ONLY the snapshot post-#816, so a fresh empty snapshot
+  // makes the graph behave as if it were empty for every read.
+  //
+  // Future extracts repopulate the snapshot + side-indexes
+  // incrementally (graph-extract is O(1) per node post-#816 — it does
+  // not consult the legacy rows).
+  //
+  // Trade-off: legacy rows in KV.graphNodes / KV.graphEdges remain on
+  // disk as unreferenced orphans. They consume disk but are never
+  // read by any post-#816 code path. Cleanup is deferred to a future
+  // chunked-vacuum job; #816's broken vacuum-via-list strategy is
+  // what we are leaving behind here.
   sdk.registerFunction("mem::graph-reset", async () => {
     const started = Date.now();
-    const counts: Record<string, number> = {
-      [KV.graphNodes]: 0,
-      [KV.graphEdges]: 0,
-      [KV.graphNameIndex]: 0,
-      [KV.graphEdgeKey]: 0,
-      [KV.graphNodeDegree]: 0,
-      [KV.graphEdgeHistory]: 0,
-      [KV.graphSnapshot]: 0,
+    // Stamp resetAt=now on the empty snapshot. Future
+    // mem::graph-extract calls compare each name-index lookup's
+    // existing node `createdAt` against this timestamp; anything
+    // older counts as an orphan and is dropped from the merge path,
+    // forcing extract to write a fresh row instead of reconnecting
+    // to a pre-reset entry.
+    const resetSnapshot: GraphSnapshot = {
+      ...emptySnapshot(),
+      resetAt: new Date().toISOString(),
     };
-
-    // Composite-key scopes (graphNameIndex / graphEdgeKey /
-    // graphNodeDegree) store primitives, not objects, so we can't
-    // recover their keys via kv.list (which returns values only). The
-    // only reliable wipe path is to walk the canonical object scopes
-    // (graphNodes / graphEdges) and reconstruct the composite keys
-    // from each node/edge's fields, deleting both the canonical row
-    // AND every derived index entry in lock-step.
-    try {
-      const nodes = await withTimeout(
-        kv.list<GraphNode>(KV.graphNodes),
-        LIVE_ENUMERATION_BUDGET_MS,
-        "graph-reset list graphNodes",
-      );
-      counts[KV.graphNodes] = nodes.length;
-      for (const node of nodes) {
-        if (!node?.id) continue;
-        await Promise.all([
-          kv.delete(KV.graphNodes, node.id).catch(() => undefined),
-          kv
-            .delete(KV.graphNameIndex, nameIndexKey(node.type, node.name))
-            .catch(() => undefined),
-          kv.delete(KV.graphNodeDegree, node.id).catch(() => undefined),
-        ]);
-        counts[KV.graphNameIndex] += 1;
-        counts[KV.graphNodeDegree] += 1;
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn("graph-reset: graphNodes list failed", { error: msg });
-      counts[KV.graphNodes] = -1;
-    }
-
-    try {
-      const edges = await withTimeout(
-        kv.list<GraphEdge>(KV.graphEdges),
-        LIVE_ENUMERATION_BUDGET_MS,
-        "graph-reset list graphEdges",
-      );
-      counts[KV.graphEdges] = edges.length;
-      for (const edge of edges) {
-        if (!edge?.id) continue;
-        await Promise.all([
-          kv.delete(KV.graphEdges, edge.id).catch(() => undefined),
-          kv
-            .delete(
-              KV.graphEdgeKey,
-              edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type),
-            )
-            .catch(() => undefined),
-        ]);
-        counts[KV.graphEdgeKey] += 1;
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn("graph-reset: graphEdges list failed", { error: msg });
-      counts[KV.graphEdges] = -1;
-    }
-
-    // graphEdgeHistory entries also key by id (audit row shape). Best
-    // effort — failures here don't block the reset.
-    try {
-      const history = await withTimeout(
-        kv.list<{ id?: string }>(KV.graphEdgeHistory),
-        LIVE_ENUMERATION_BUDGET_MS,
-        "graph-reset list graphEdgeHistory",
-      );
-      counts[KV.graphEdgeHistory] = history.length;
-      for (const row of history) {
-        if (row?.id) {
-          await kv.delete(KV.graphEdgeHistory, row.id).catch(() => undefined);
-        }
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.warn("graph-reset: graphEdgeHistory list failed", { error: msg });
-      counts[KV.graphEdgeHistory] = -1;
-    }
-
-    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, emptySnapshot());
-    counts[KV.graphSnapshot] = 1;
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, resetSnapshot);
+    const counts: Record<string, number> = {
+      [KV.graphSnapshot]: 1,
+    };
     const tookMs = Date.now() - started;
     logger.info("Graph state reset", { counts, tookMs });
     return { success: true, cleared: counts, tookMs };
